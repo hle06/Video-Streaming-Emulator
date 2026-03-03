@@ -1,381 +1,395 @@
 /*
- * Pixel Update Receiver for ESP32 T-Display (ST7789 135x240)
- * Receives per-pixel updates (x, y, RGB565) over TCP and applies them.
+ * ESP32 T-Display Pixel Receiver (ST7789 135x240)
+ * Listens for per-pixel or run-length encoded updates over TCP.
  * Protocol v2 (little-endian):
- *   Header: 'P' 'X' 'U' 'P' (4 bytes) + version (1 byte, 0x02) + frame_id (uint32 LE) + count (uint16)
- *   Body:   count entries of: x (uint8), y (uint8), color (uint16 LE)
+ *   PXUP Header: 'P','X','U','P' (4B) + ver (1B, 0x02) + frame_id (uint32) + count (uint16)
+ *   PXUP Body:   count * [x (uint8), y (uint8), color (uint16)]
+ *   PXUR Header: 'P','X','U','R' (4B) + ver (1B, 0x01) + frame_id (uint32) + count (uint16)
+ *   PXUR Body:   count * [y (uint8), x0 (uint8), len (uint8), color (uint16)]
  *
- * Optimized for high frame rates with:
- * - Fast SPI clock (80MHz default, configurable)
- * - DMA support for efficient display updates
- * - Run-length encoding support for reduced bandwidth
+ * Performance optimizations:
+ * - 80MHz SPI clock
+ * - DMA transfers when available
+ * - Batched display writes
  */
 
-#include <TFT_eSPI.h>
-#include <SPI.h>
 #include <WiFi.h>
 #include <WiFiServer.h>
-#include <esp_heap_caps.h>  // for PSRAM allocations
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <esp_heap_caps.h>
 
-#define TFT_MADCTL 0x36
+#define TFT_MADCTL     0x36
 #define TFT_MADCTL_RGB 0x00
 #define TFT_MADCTL_BGR 0x08
 
-TFT_eSPI tft = TFT_eSPI();
+// Screen parameters
+#define SCREEN_W 135
+#define SCREEN_H 240
 
-// Display dimensions
-#define DISPLAY_WIDTH 135
-#define DISPLAY_HEIGHT 240
+TFT_eSPI display = TFT_eSPI();
 
-// Try the fastest stable SPI clock for the panel; lower to 40000000 if unstable
-const uint32_t SPI_TARGET_FREQ = 80000000;
+// SPI frequency — reduce to 40000000 if display glitches occur
+const uint32_t SPI_FREQ = 80000000;
 
-// WiFi credentials - UPDATE THESE WITH YOUR NETWORK
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+// Wifi credentials
+const char* ssid = "GTother"; 
+const char* password = "GeorgeP@1927"; 
 
-// Network settings
-WiFiServer server(8090);  // dedicated port for pixel updates
-WiFiClient client;
+// TCP server
+WiFiServer tcpServer(8090);
+WiFiClient tcpClient;
 
-// Protocol constants (v2 adds frame_id to the header)
-const uint8_t MAGIC[4] = {'P', 'X', 'U', 'P'};
-const uint8_t PROTO_VERSION = 0x02;
-const size_t HEADER_SIZE = 11;  // MAGIC (4) + version (1) + frame_id (4) + count (2)
-const uint8_t MAGIC_RUN[4] = {'P', 'X', 'U', 'R'};
-const uint8_t RUN_VERSION = 0x01;
-const size_t RUN_HEADER_SIZE = 11;  // MAGIC_RUN (4) + version (1) + frame_id (4) + count (2)
+// Protocol magic bytes and versions
+const uint8_t HDR_MAGIC[4] = {'P', 'X', 'U', 'P'};
+const uint8_t RUN_MAGIC[4] = {'P', 'X', 'U', 'R'};
+const uint8_t HDR_VER      = 0x02;
+const uint8_t RUN_VER      = 0x01;
+const size_t  PKT_HDR_SIZE = 11;  // magic(4) + version(1) + frame_id(4) + count(2)
 
-// Color configuration (adjust if colors appear swapped)
-bool swapBytesSetting = false;  // keep false; colors are provided as RGB565 little-endian
-bool useBgrSetting   = true;    // many ST7789 panels are BGR wired
+// Color mode flags
+bool doSwapBytes = false;   // RGB565 arrives little-endian, no swap needed
+bool isBgrPanel  = true;    // ST7789 panels typically use BGR ordering
 
-// Stats
-unsigned long frameCount = 0;
-unsigned long lastStats = 0;
-unsigned long updatesApplied = 0;
-uint32_t lastFrameId = 0;
+// Statistics tracking
+unsigned long totalFrames   = 0;
+unsigned long statsTimer    = 0;
+unsigned long pixelsWritten = 0;
+uint32_t      curFrameId    = 0;
 
-struct PixelUpdate {
-  uint8_t x;
-  uint8_t y;
-  uint8_t len;    // for run packets
+// Pixel data structure for buffering incoming updates
+struct PixelData {
+  uint8_t  x;
+  uint8_t  y;
+  uint8_t  runLen;
   uint16_t color;
 };
 
-PixelUpdate* updateBuffer = nullptr;
-uint32_t bufferCapacity = 0;
-bool dmaEnabled = false;
+PixelData* pixelBuf    = nullptr;
+uint32_t   bufCapacity = 0;
+bool       hasDma      = false;
 
-bool ensureUpdateBuffer(uint32_t needed) {
-  if (needed <= bufferCapacity && updateBuffer != nullptr) {
+// Allocate or grow the pixel buffer, preferring PSRAM
+bool prepareBuffer(uint32_t needed) {
+  if (needed <= bufCapacity && pixelBuf != nullptr) {
     return true;
   }
-  PixelUpdate* tmp = (PixelUpdate*)ps_malloc(needed * sizeof(PixelUpdate));
-  if (!tmp) {
-    tmp = (PixelUpdate*)malloc(needed * sizeof(PixelUpdate));
+  PixelData* newBuf = (PixelData*)ps_malloc(needed * sizeof(PixelData));
+  if (!newBuf) {
+    newBuf = (PixelData*)malloc(needed * sizeof(PixelData));
   }
-  if (!tmp) {
-    Serial.println("Failed to allocate update buffer");
+  if (!newBuf) {
+    Serial.println("Buffer allocation failed");
     return false;
   }
-  if (updateBuffer) {
-    free(updateBuffer);
+  if (pixelBuf) {
+    free(pixelBuf);
   }
-  updateBuffer = tmp;
-  bufferCapacity = needed;
+  pixelBuf    = newBuf;
+  bufCapacity = needed;
   return true;
 }
 
-bool readExactly(WiFiClient& c, uint8_t* dst, size_t len) {
-  size_t got = 0;
-  while (got < len && c.connected()) {
-    int chunk = c.read(dst + got, len - got);
-    if (chunk > 0) {
-      got += chunk;
+// Read exactly 'len' bytes from the TCP stream
+bool readFully(WiFiClient& conn, uint8_t* dest, size_t len) {
+  size_t received = 0;
+  while (received < len && conn.connected()) {
+    int n = conn.read(dest + received, len - received);
+    if (n > 0) {
+      received += n;
     } else {
-      delay(1);  // allow other tasks
+      delay(1);
     }
   }
-  return got == len;
+  return received == len;
 }
 
-void applyColorConfig() {
-  tft.setSwapBytes(swapBytesSetting);
-  tft.writecommand(TFT_MADCTL);
-  tft.writedata(useBgrSetting ? TFT_MADCTL_BGR : TFT_MADCTL_RGB);
+// Configure display color byte order
+void setupColorMode() {
+  display.setSwapBytes(doSwapBytes);
+  display.writecommand(TFT_MADCTL);
+  display.writedata(isBgrPanel ? TFT_MADCTL_BGR : TFT_MADCTL_RGB);
 }
 
-void showWaitingScreen() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 20);
-  tft.setTextSize(2);
-  tft.println("Pixel RX");
-  tft.setCursor(10, 50);
-  tft.setTextSize(1);
-  tft.println("IP Address:");
-  tft.setCursor(10, 70);
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.println(WiFi.localIP().toString());
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 100);
-  tft.setTextSize(1);
-  tft.println("Waiting for");
-  tft.setCursor(10, 115);
-  tft.println("connection...");
+// Show idle screen with IP address while waiting for a connection
+void renderIdleScreen() {
+  display.fillScreen(TFT_BLACK);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.setCursor(10, 20);
+  display.setTextSize(2);
+  display.println("Pixel RX");
+  display.setCursor(10, 50);
+  display.setTextSize(1);
+  display.println("IP Address:");
+  display.setCursor(10, 70);
+  display.setTextSize(2);
+  display.setTextColor(TFT_GREEN, TFT_BLACK);
+  display.println(WiFi.localIP().toString());
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.setCursor(10, 100);
+  display.setTextSize(1);
+  display.println("Waiting for");
+  display.setCursor(10, 115);
+  display.println("connection...");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== Pixel Update Receiver ===");
+  Serial.println("\n=== ESP32 Pixel Receiver ===");
 
+  // Enable backlight
   pinMode(4, OUTPUT);
-  digitalWrite(4, HIGH);  // backlight
-  tft.init();
-  SPI.setFrequency(SPI_TARGET_FREQ);
-  dmaEnabled = tft.initDMA();
-  tft.setRotation(0);  // portrait
-  applyColorConfig();
-  tft.fillScreen(TFT_BLACK);
+  digitalWrite(4, HIGH);
 
-  Serial.print("Connecting to WiFi: ");
+  // Initialize display
+  display.init();
+  SPI.setFrequency(SPI_FREQ);
+  hasDma = display.initDMA();
+  display.setRotation(0);
+  setupColorMode();
+  display.fillScreen(TFT_BLACK);
+
+  // Connect to WiFi
+  Serial.print("Connecting to ");
   Serial.println(ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
     delay(250);
     Serial.print(".");
-    attempts++;
+    retries++;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nWiFi connection failed");
-    tft.fillScreen(TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.setCursor(10, 50);
-    tft.setTextSize(2);
-    tft.println("WiFi FAILED!");
-    while (true) {
-      delay(1000);
-    }
+    Serial.println("\nFailed to connect to WiFi");
+    display.fillScreen(TFT_RED);
+    display.setTextColor(TFT_WHITE, TFT_RED);
+    display.setCursor(10, 50);
+    display.setTextSize(2);
+    display.println("WiFi FAILED!");
+    while (true) { delay(1000); }
   }
 
-  Serial.println("\nWiFi connected");
-  Serial.print("IP: ");
+  Serial.println("\nConnected to WiFi");
+  Serial.print("Device IP: ");
   Serial.println(WiFi.localIP());
 
-  showWaitingScreen();
+  renderIdleScreen();
 
-  server.begin();
-  server.setNoDelay(true);
-  Serial.println("Server listening on port 8090");
+  tcpServer.begin();
+  tcpServer.setNoDelay(true);
+  Serial.println("Listening on port 8090");
 }
 
-bool handleClient() {
-  // Accept new client
-  if (!client || !client.connected()) {
-    client = server.available();
-    if (client) {
+// Process incoming data from the connected client
+bool processConnection() {
+  // Accept a new client if none is connected
+  if (!tcpClient || !tcpClient.connected()) {
+    tcpClient = tcpServer.available();
+    if (tcpClient) {
       Serial.println("Client connected");
-      client.setNoDelay(true);
-      client.setTimeout(50);  // short timeout for reads
-      frameCount = 0;
-      updatesApplied = 0;
-      tft.fillScreen(TFT_BLACK);
+      tcpClient.setNoDelay(true);
+      tcpClient.setTimeout(50);
+      totalFrames   = 0;
+      pixelsWritten = 0;
+      display.fillScreen(TFT_BLACK);
     }
   }
 
-  if (!client || !client.connected()) {
+  if (!tcpClient || !tcpClient.connected()) {
     return false;
   }
 
-  // Require header to begin processing (pixel or run)
-  if (client.available() < 11) {
-    return true;  // keep connection, wait for more data
+  // Need at least a full header before processing
+  if (tcpClient.available() < 11) {
+    return true;
   }
 
-  // Peek magic to decide packet type
-  uint8_t magicBuf[4];
-  if (!readExactly(client, magicBuf, 4)) {
-    client.stop();
+  // Read and identify the packet magic
+  uint8_t magic[4];
+  if (!readFully(tcpClient, magic, 4)) {
+    tcpClient.stop();
     return false;
   }
-  bool isRun = (memcmp(magicBuf, MAGIC_RUN, 4) == 0);
-  bool isPixel = (memcmp(magicBuf, MAGIC, 4) == 0);
+  bool isRunPkt   = (memcmp(magic, RUN_MAGIC, 4) == 0);
+  bool isPixelPkt = (memcmp(magic, HDR_MAGIC, 4) == 0);
 
-  if (!isRun && !isPixel) {
-    Serial.println("Bad magic; flushing stream");
-    client.stop();
+  if (!isRunPkt && !isPixelPkt) {
+    Serial.println("Invalid magic; dropping client");
+    tcpClient.stop();
     return false;
   }
 
-  if (isPixel) {
-    uint8_t rest[HEADER_SIZE - 4];
-    if (!readExactly(client, rest, sizeof(rest))) {
-      Serial.println("Failed to read pixel header; dropping client");
-      client.stop();
+  // --- Handle PXUP (individual pixel updates) ---
+  if (isPixelPkt) {
+    uint8_t hdr[PKT_HDR_SIZE - 4];
+    if (!readFully(tcpClient, hdr, sizeof(hdr))) {
+      Serial.println("Incomplete pixel header; dropping");
+      tcpClient.stop();
       return false;
     }
-    if (rest[0] != PROTO_VERSION) {
-      Serial.print("Unsupported pixel version: ");
-      Serial.println(rest[0], HEX);
-      client.stop();
+    if (hdr[0] != HDR_VER) {
+      Serial.print("Unknown pixel version: 0x");
+      Serial.println(hdr[0], HEX);
+      tcpClient.stop();
       return false;
     }
 
-    uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
-    uint16_t count = rest[5] | (rest[6] << 8);  // little-endian
+    uint32_t frameId = (uint32_t)hdr[1] | ((uint32_t)hdr[2] << 8) |
+                       ((uint32_t)hdr[3] << 16) | ((uint32_t)hdr[4] << 24);
+    uint16_t count   = hdr[5] | (hdr[6] << 8);
+
     if (count == 0) {
-      frameCount++;
-      lastFrameId = frameId;
+      totalFrames++;
+      curFrameId = frameId;
       return true;
     }
-    if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
-      Serial.print("Update count too large: ");
+    if (count > (SCREEN_W * SCREEN_H)) {
+      Serial.print("Pixel count exceeds screen: ");
       Serial.println(count);
-      client.stop();
+      tcpClient.stop();
       return false;
     }
 
-    if (!ensureUpdateBuffer(count)) {
-      Serial.println("No buffer for updates; dropping client");
-      client.stop();
+    if (!prepareBuffer(count)) {
+      Serial.println("Cannot allocate pixel buffer; dropping");
+      tcpClient.stop();
       return false;
     }
 
-    uint8_t entry[4];
+    // Read all pixel entries
+    uint8_t raw[4];
     for (uint16_t i = 0; i < count; i++) {
-      if (!readExactly(client, entry, 4)) {
-        Serial.println("Stream ended mid-frame; dropping client");
-        client.stop();
+      if (!readFully(tcpClient, raw, 4)) {
+        Serial.println("Truncated pixel data; dropping");
+        tcpClient.stop();
         return false;
       }
-      updateBuffer[i].x = entry[0];
-      updateBuffer[i].y = entry[1];
-      updateBuffer[i].color = entry[2] | (entry[3] << 8);
+      pixelBuf[i].x     = raw[0];
+      pixelBuf[i].y     = raw[1];
+      pixelBuf[i].color = raw[2] | (raw[3] << 8);
     }
 
-    // Apply all updates in one batch after the full frame is received
-    tft.startWrite();
+    // Push to display in a single transaction
+    display.startWrite();
     for (uint16_t i = 0; i < count; i++) {
-      uint8_t x = updateBuffer[i].x;
-      uint8_t y = updateBuffer[i].y;
-      if (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT) {
-        tft.setAddrWindow(x, y, 1, 1);
-        tft.writeColor(updateBuffer[i].color, 1);
-        updatesApplied++;
+      uint8_t px = pixelBuf[i].x;
+      uint8_t py = pixelBuf[i].y;
+      if (px < SCREEN_W && py < SCREEN_H) {
+        display.setAddrWindow(px, py, 1, 1);
+        display.writeColor(pixelBuf[i].color, 1);
+        pixelsWritten++;
       }
     }
-    tft.endWrite();
+    display.endWrite();
 
-    frameCount++;
-    lastFrameId = frameId;
+    totalFrames++;
+    curFrameId = frameId;
     unsigned long now = millis();
-    if (now - lastStats > 2000) {
+    if (now - statsTimer > 2000) {
       Serial.print("Frames: ");
-      Serial.print(frameCount);
-      Serial.print(" (last frameId ");
-      Serial.print(lastFrameId);
-      Serial.print(") | Updates applied: ");
-      Serial.println(updatesApplied);
-      lastStats = now;
+      Serial.print(totalFrames);
+      Serial.print(" (frameId ");
+      Serial.print(curFrameId);
+      Serial.print(") | Pixels drawn: ");
+      Serial.println(pixelsWritten);
+      statsTimer = now;
     }
     return true;
   }
 
-  // Run packet
-  uint8_t rest[RUN_HEADER_SIZE - 4];
-  if (!readExactly(client, rest, sizeof(rest))) {
-    Serial.println("Failed to read run header; dropping client");
-    client.stop();
+  // --- Handle PXUR (run-length encoded updates) ---
+  uint8_t hdr[PKT_HDR_SIZE - 4];
+  if (!readFully(tcpClient, hdr, sizeof(hdr))) {
+    Serial.println("Incomplete run header; dropping");
+    tcpClient.stop();
     return false;
   }
-  if (rest[0] != RUN_VERSION) {
-    Serial.print("Unsupported run version: ");
-    Serial.println(rest[0], HEX);
-    client.stop();
+  if (hdr[0] != RUN_VER) {
+    Serial.print("Unknown run version: 0x");
+    Serial.println(hdr[0], HEX);
+    tcpClient.stop();
     return false;
   }
 
-  uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
-  uint16_t count = rest[5] | (rest[6] << 8);  // number of runs
+  uint32_t frameId = (uint32_t)hdr[1] | ((uint32_t)hdr[2] << 8) |
+                     ((uint32_t)hdr[3] << 16) | ((uint32_t)hdr[4] << 24);
+  uint16_t count   = hdr[5] | (hdr[6] << 8);
+
   if (count == 0) {
-    frameCount++;
-    lastFrameId = frameId;
+    totalFrames++;
+    curFrameId = frameId;
     return true;
   }
-  if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
-    Serial.print("Run count too large: ");
+  if (count > (SCREEN_W * SCREEN_H)) {
+    Serial.print("Run count exceeds limit: ");
     Serial.println(count);
-    client.stop();
+    tcpClient.stop();
     return false;
   }
 
-  if (!ensureUpdateBuffer(count)) {
-    Serial.println("No buffer for run updates; dropping client");
-    client.stop();
+  if (!prepareBuffer(count)) {
+    Serial.println("Cannot allocate run buffer; dropping");
+    tcpClient.stop();
     return false;
   }
 
-  // Each run entry: y (1), x0 (1), length (1), color (2) = 5 bytes
-  uint8_t entry[5];
+  // Read run entries: y(1) + x0(1) + length(1) + color(2) = 5 bytes each
+  uint8_t raw[5];
   for (uint16_t i = 0; i < count; i++) {
-    if (!readExactly(client, entry, 5)) {
-      Serial.println("Stream ended mid-run frame; dropping client");
-      client.stop();
+    if (!readFully(tcpClient, raw, 5)) {
+      Serial.println("Truncated run data; dropping");
+      tcpClient.stop();
       return false;
     }
-    updateBuffer[i].y = entry[0];
-    updateBuffer[i].x = entry[1];
-    updateBuffer[i].len = entry[2];
-    updateBuffer[i].color = entry[3] | (entry[4] << 8);
+    pixelBuf[i].y      = raw[0];
+    pixelBuf[i].x      = raw[1];
+    pixelBuf[i].runLen  = raw[2];
+    pixelBuf[i].color   = raw[3] | (raw[4] << 8);
   }
 
-  // Apply runs in one batch
-  tft.startWrite();
+  // Render all runs in a single display transaction
+  display.startWrite();
   for (uint16_t i = 0; i < count; i++) {
-    uint8_t x0 = updateBuffer[i].x;
-    uint8_t y = updateBuffer[i].y;
-    uint8_t runLen = updateBuffer[i].len;
-    if (x0 < DISPLAY_WIDTH && y < DISPLAY_HEIGHT && runLen > 0 && (x0 + runLen) <= DISPLAY_WIDTH) {
-      tft.setAddrWindow(x0, y, runLen, 1);
-      if (dmaEnabled) {
-        tft.pushBlock(updateBuffer[i].color, runLen);
+    uint8_t rx  = pixelBuf[i].x;
+    uint8_t ry  = pixelBuf[i].y;
+    uint8_t rln = pixelBuf[i].runLen;
+    if (rx < SCREEN_W && ry < SCREEN_H && rln > 0 && (rx + rln) <= SCREEN_W) {
+      display.setAddrWindow(rx, ry, rln, 1);
+      if (hasDma) {
+        display.pushBlock(pixelBuf[i].color, rln);
       } else {
-        tft.writeColor(updateBuffer[i].color, runLen);
+        display.writeColor(pixelBuf[i].color, rln);
       }
-      updatesApplied += runLen;
+      pixelsWritten += rln;
     }
   }
-  tft.endWrite();
+  display.endWrite();
 
-  frameCount++;
-  lastFrameId = frameId;
+  totalFrames++;
+  curFrameId = frameId;
   unsigned long now = millis();
-  if (now - lastStats > 2000) {
+  if (now - statsTimer > 2000) {
     Serial.print("Frames: ");
-    Serial.print(frameCount);
-    Serial.print(" (last frameId ");
-    Serial.print(lastFrameId);
-    Serial.print(") | Updates applied: ");
-    Serial.println(updatesApplied);
-    lastStats = now;
+    Serial.print(totalFrames);
+    Serial.print(" (frameId ");
+    Serial.print(curFrameId);
+    Serial.print(") | Pixels drawn: ");
+    Serial.println(pixelsWritten);
+    statsTimer = now;
   }
 
   return true;
 }
 
 void loop() {
-  handleClient();
-  if (client && !client.connected()) {
+  processConnection();
+  if (tcpClient && !tcpClient.connected()) {
     Serial.println("Client disconnected");
-    showWaitingScreen();
+    renderIdleScreen();
   }
   delay(1);
 }
-
